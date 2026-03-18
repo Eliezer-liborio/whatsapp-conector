@@ -1,20 +1,16 @@
-// content.js — WhatsApp para HubSpot CRM  v2.1.0
+// content.js — WhatsApp para HubSpot CRM  v2.2.0
 // ─────────────────────────────────────────────────────────────────────────────
+// NOVIDADES v2.2.0:
+//   - Deduplicação de mensagens: apenas conteúdo NOVO (não enviado anteriormente
+//     ao HubSpot) é sincronizado. O histórico de mensagens já enviadas é
+//     persistido no chrome.storage.local, por número de telefone.
+//
 // HIERARQUIA DE CAPTURA DO NÚMERO (ordem de prioridade):
-//
-//  1. Store interna do WhatsApp (inject.js)  ← NOVA — funciona para TODOS os
-//     contatos, com ou sem agenda, com ou sem mensagens prévias na sessão.
-//
-//  2. data-id das mensagens no DOM           ← confiável, mas exige ao menos
-//     uma mensagem carregada na tela.
-//
-//  3. URL da página (?phone=)                ← funciona para chats abertos
-//     via link direto (wa.me / send?phone=).
-//
-//  4. Subtítulo do header                    ← funciona para contatos NÃO
-//     salvos na agenda.
-//
-//  5. data-pre-plain-text                    ← fallback geral.
+//   1. Store interna do WhatsApp (inject.js) — funciona para TODOS os contatos
+//   2. data-id das mensagens no DOM
+//   3. URL da página (?phone=)
+//   4. Subtítulo do header
+//   5. data-pre-plain-text
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MIDDLEWARE_URL = 'http://localhost:3000/api/whatsapp-to-hubspot';
@@ -22,17 +18,14 @@ const BTN_ID         = 'hubspot-save-btn';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INJEÇÃO DO SCRIPT NO CONTEXTO PRINCIPAL DA PÁGINA
-// O content script roda em um contexto isolado (sandbox) e não tem acesso
-// direto ao window da página. Para acessar a Store interna do WhatsApp,
-// precisamos injetar um script no contexto principal via <script src>.
 // ─────────────────────────────────────────────────────────────────────────────
 (function injectPageScript() {
   try {
-    if (document.getElementById('wa-hubspot-injector')) return; // já injetado
+    if (document.getElementById('wa-hubspot-injector')) return;
     const script = document.createElement('script');
     script.id  = 'wa-hubspot-injector';
     script.src = chrome.runtime.getURL('inject.js');
-    script.onload = () => script.remove(); // limpa o DOM após carregar
+    script.onload = () => script.remove();
     (document.head || document.documentElement).appendChild(script);
   } catch (e) {
     console.warn('[WA→HubSpot] Falha ao injetar inject.js:', e);
@@ -40,8 +33,64 @@ const BTN_ID         = 'hubspot-save-btn';
 })();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ESTRATÉGIA 1 (NOVA): Consulta a Store interna via inject.js
-// Envia uma mensagem para o contexto principal e aguarda a resposta.
+// DEDUPLICAÇÃO — chave única por mensagem
+// Gera um hash simples e determinístico baseado nos campos da mensagem.
+// Formato: "phone|time|from|text" (normalizado)
+// ─────────────────────────────────────────────────────────────────────────────
+function messageKey(phone, msg) {
+  const raw = [
+    (phone  || '').trim(),
+    (msg.time || '').trim(),
+    (msg.from || '').trim(),
+    (msg.text || '').trim().toLowerCase(),
+  ].join('|');
+
+  // Hash djb2 simples (sem dependências externas)
+  let hash = 5381;
+  for (let i = 0; i < raw.length; i++) {
+    hash = ((hash << 5) + hash) ^ raw.charCodeAt(i);
+    hash = hash >>> 0; // mantém unsigned 32-bit
+  }
+  return hash.toString(36); // base36 para compactar
+}
+
+// Carrega o conjunto de chaves já enviadas para um determinado telefone
+function loadSentKeys(phone) {
+  return new Promise((resolve) => {
+    const storageKey = 'sent_' + (phone || 'unknown');
+    chrome.storage.local.get([storageKey], (result) => {
+      resolve(new Set(result[storageKey] || []));
+    });
+  });
+}
+
+// Persiste o conjunto atualizado de chaves enviadas
+function saveSentKeys(phone, keysSet) {
+  return new Promise((resolve) => {
+    const storageKey = 'sent_' + (phone || 'unknown');
+    chrome.storage.local.set({ [storageKey]: [...keysSet] }, resolve);
+  });
+}
+
+// Filtra apenas as mensagens ainda não enviadas e retorna junto com as chaves novas
+async function filterNewMessages(phone, messages) {
+  const sentKeys  = await loadSentKeys(phone);
+  const newMsgs   = [];
+  const newKeys   = [];
+
+  for (const msg of messages) {
+    const key = messageKey(phone, msg);
+    if (!sentKeys.has(key)) {
+      newMsgs.push(msg);
+      newKeys.push(key);
+    }
+  }
+
+  return { newMsgs, newKeys, sentKeys };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ESTRATÉGIA 1: Store interna via inject.js
 // ─────────────────────────────────────────────────────────────────────────────
 function extractPhoneViaStore() {
   return new Promise((resolve) => {
@@ -53,10 +102,7 @@ function extractPhoneViaStore() {
       if (resolved) return;
       resolved = true;
       window.removeEventListener('message', listener);
-      resolve({
-        phone: event.data.phone || null,
-        name:  event.data.name  || null,
-      });
+      resolve({ phone: event.data.phone || null, name: event.data.name || null });
     };
 
     window.addEventListener('message', listener);
@@ -74,8 +120,6 @@ function extractPhoneViaStore() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ESTRATÉGIA 2: data-id das mensagens no DOM
-// Formato: "false_5566996215988@c.us_XXXXXXXX"  (recebida)
-//          "true_5566996215988@c.us_XXXXXXXX"   (enviada)
 // ─────────────────────────────────────────────────────────────────────────────
 function extractPhoneFromDataId() {
   const received = document.querySelectorAll('[data-id^="false_"]');
@@ -106,7 +150,7 @@ function extractPhoneFromURL() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ESTRATÉGIA 4: Subtítulo do header (contatos NÃO salvos)
+// ESTRATÉGIA 4: Subtítulo do header
 // ─────────────────────────────────────────────────────────────────────────────
 function extractPhoneFromHeader() {
   const selectors = [
@@ -126,7 +170,6 @@ function extractPhoneFromHeader() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ESTRATÉGIA 5: data-pre-plain-text
-// Formato: "[hora, data] +55 66 99999-9999:"
 // ─────────────────────────────────────────────────────────────────────────────
 function extractPhoneFromPreText() {
   const els = document.querySelectorAll('[data-pre-plain-text]');
@@ -141,7 +184,7 @@ function extractPhoneFromPreText() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Captura o nome do contato via DOM
+// Nome do contato via DOM
 // ─────────────────────────────────────────────────────────────────────────────
 function getContactNameFromDOM() {
   const selectors = [
@@ -162,10 +205,9 @@ function getContactNameFromDOM() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Orquestra todas as estratégias de captura (assíncrono)
+// Orquestra todas as estratégias de captura
 // ─────────────────────────────────────────────────────────────────────────────
 async function getContactInfo() {
-  // Estratégia 1: Store interna (mais confiável — funciona para todos)
   const storeResult = await extractPhoneViaStore();
 
   const phone = storeResult.phone
@@ -289,42 +331,59 @@ function createFixedButton() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Ação do botão
+// Ação do botão — com deduplicação
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleSave() {
   const btn     = document.getElementById(BTN_ID);
   const btnText = document.getElementById('hubspot-btn-text');
   if (!btn || !btnText) return;
 
-  const messages = getMessages();
-  if (messages.length === 0) {
+  const allMessages = getMessages();
+  if (allMessages.length === 0) {
     showToast('Abra uma conversa antes de salvar.', 'error');
     return;
   }
 
-  // Estado: carregando
-  btnText.innerText           = 'Capturando...';
-  btn.disabled                = true;
-  btn.style.backgroundColor   = '#aaaaaa';
-  btn.style.cursor            = 'not-allowed';
+  // Estado: capturando número
+  btnText.innerText         = 'Capturando...';
+  btn.disabled              = true;
+  btn.style.backgroundColor = '#aaaaaa';
+  btn.style.cursor          = 'not-allowed';
 
   const { name, phone } = await getContactInfo();
 
-  btnText.innerText = 'Salvando...';
+  // Estado: filtrando mensagens novas
+  btnText.innerText = 'Verificando...';
+
+  const { newMsgs, newKeys, sentKeys } = await filterNewMessages(phone, allMessages);
+
+  // Nenhuma mensagem nova — tudo já foi enviado antes
+  if (newMsgs.length === 0) {
+    showToast('Nenhuma mensagem nova para enviar. Tudo já está no HubSpot.', 'info');
+    resetButton(btn, btnText);
+    return;
+  }
+
+  btnText.innerText = `Salvando ${newMsgs.length} msg${newMsgs.length > 1 ? 's' : ''}...`;
 
   try {
     const res = await fetch(MIDDLEWARE_URL, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ contactName: name, phone, messages }),
+      body:    JSON.stringify({ contactName: name, phone, messages: newMsgs }),
     });
 
     const data = await res.json();
 
     if (data.success) {
-      showToast('Conversa salva no HubSpot!', 'success');
-      btnText.innerText           = 'Salvo!';
-      btn.style.backgroundColor   = '#25D366';
+      // Persiste as chaves das mensagens recém-enviadas
+      const updatedKeys = new Set([...sentKeys, ...newKeys]);
+      await saveSentKeys(phone, updatedKeys);
+
+      const total = newMsgs.length;
+      showToast(`${total} mensagem${total > 1 ? 's' : ''} nova${total > 1 ? 's' : ''} salva${total > 1 ? 's' : ''} no HubSpot!`, 'success');
+      btnText.innerText         = 'Salvo!';
+      btn.style.backgroundColor = '#25D366';
       setTimeout(() => resetButton(btn, btnText), 3000);
     } else {
       showToast(data.error || 'Erro ao salvar.', 'error');
@@ -337,18 +396,24 @@ async function handleSave() {
 }
 
 function resetButton(btn, btnText) {
-  btnText.innerText           = 'Salvar no HubSpot';
-  btn.style.backgroundColor   = '#FF7A59';
-  btn.disabled                = false;
-  btn.style.cursor            = 'pointer';
+  btnText.innerText         = 'Salvar no HubSpot';
+  btn.style.backgroundColor = '#FF7A59';
+  btn.disabled              = false;
+  btn.style.cursor          = 'pointer';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Toast de notificação
+// Toast de notificação (suporta tipo 'info' além de success/error)
 // ─────────────────────────────────────────────────────────────────────────────
 function showToast(message, type = 'success') {
   const existing = document.getElementById('hubspot-toast');
   if (existing) existing.remove();
+
+  const colors = {
+    success: '#25D366',
+    error:   '#e53935',
+    info:    '#1565C0',
+  };
 
   const toast = document.createElement('div');
   toast.id    = 'hubspot-toast';
@@ -358,7 +423,7 @@ function showToast(message, type = 'success') {
     bottom: 28px;
     left: 50%;
     transform: translateX(-50%);
-    background-color: ${type === 'success' ? '#25D366' : '#e53935'};
+    background-color: ${colors[type] || colors.info};
     color: white;
     padding: 12px 28px;
     border-radius: 24px;

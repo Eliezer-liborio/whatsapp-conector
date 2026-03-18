@@ -163,7 +163,7 @@ app.post('/api/whatsapp-to-hubspot', async (req, res) => {
     console.log('Nova exportacao recebida');
     console.log('  Contato : ' + (contactName || 'Desconhecido'));
     console.log('  Telefone: ' + (phone || 'nao capturado'));
-    console.log('  Msgs    : ' + messages.length);
+    console.log('  Msgs    : ' + messages.length + ' (apenas mensagens novas, após deduplicação na extensão)');
 
     // Sem telefone — nao e possivel buscar
     if (!digits || digits.length < 8) {
@@ -204,7 +204,8 @@ app.post('/api/whatsapp-to-hubspot', async (req, res) => {
       message: `Conversa salva na timeline de ${fullName}!`,
       contactId: contact.id,
       contactName: fullName,
-      noteId: note.id
+      noteId: note.id,
+      msgCount: messages.length
     });
 
   } catch (err) {
