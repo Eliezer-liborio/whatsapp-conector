@@ -6,7 +6,7 @@
 
 ##  O que faz?
 
-Ao abrir uma conversa no WhatsApp Web, um botão **"📤 Salvar no HubSpot"** é adicionado automaticamente ao header do chat. Com um clique, toda a conversa é capturada e registrada como uma **nota (NOTE)** na timeline do contato no HubSpot CRM.
+Ao abrir uma conversa no WhatsApp Web, um botão **" Salvar no HubSpot"** é adicionado automaticamente ao header do chat. Com um clique, toda a conversa é capturada e registrada como uma **nota (NOTE)** na timeline do contato no HubSpot CRM.
 
 ```
 WhatsApp Web
